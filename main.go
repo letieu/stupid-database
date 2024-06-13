@@ -1,147 +1,83 @@
 package main
 
-import (
-	"encoding/binary"
-	"fmt"
+import "encoding/binary"
+
+// | type | nkeys |  pointers  |   offsets  | key-values | unused |
+// |  2B  |   2B  | nkeys * 8B | nkeys * 2B |     ...    |        |
+
+// | klen | vlen | key | val |
+// |  2B  |  2B  | ... | ... |
+
+const HEADER = 4
+const BTREE_PAGE_SIZE = 4096
+const BTREE_MAX_KEY_SIZE = 1000
+const BTREE_MAX_VAL_SIZE = 3000
+
+func init() {
+	// TODO: Check this logic later
+	node1max := HEADER + 8 + 2 + 4 + BTREE_MAX_KEY_SIZE + BTREE_MAX_VAL_SIZE
+	if node1max > BTREE_PAGE_SIZE {
+		panic("node1max <= BTREE_PAGE_SIZE")
+	}
+}
+
+type BNode []byte
+
+type BTree struct {
+	// pointer
+	root uint64
+
+	get func(uint64) []byte
+	new func([]byte) uint64
+	del func(uint64)
+}
+
+const (
+	BNODE_NODE = 1 // internal nodes without values
+	BNODE_LEAF = 2 // leaf nodes with values
 )
 
-const fnvOffSetBasis uint64 = 14695981039346656037
-const fnvPrime uint64 = 1099511628211
-const loadFactorThreshold = 2
+func (node BNode) btype() uint16 {
+	return binary.LittleEndian.Uint16(node[:2])
+}
 
-// FNV-1a
-func hashValue(v PreHashable, limit int) uint {
-	hash := fnvOffSetBasis
+func (node BNode) nkeys() uint16 {
+	return binary.LittleEndian.Uint16(node[2:4])
+}
 
-	for _, b := range v.HashBytes() {
-		hash = hash ^ uint64(b)
-		hash = hash * fnvPrime
+func (node BNode) setHeader(btype uint16, nkeys uint16) {
+	binary.LittleEndian.PutUint16(node[:2], btype)
+	binary.LittleEndian.PutUint16(node[2:4], nkeys)
+}
+
+// pointer
+func (node BNode) getPtr(idx uint16) uint64 {
+	if idx >= node.nkeys() {
+		panic("idx >= node.nkeys()")
 	}
 
-	return uint(hash % uint64(limit))
+	pos := HEADER + 8*idx
+	return binary.LittleEndian.Uint64(node[pos:])
 }
 
-type IntKey int
-type StringKey string
+func (node BNode) setPtr(idx uint16, val uint64)
 
-type PreHashable interface {
-	HashBytes() []byte
-	Equal(PreHashable) bool
+// offset list
+func offsetPos(node BNode, idx uint16) uint16 {
+	return HEADER + 8*node.nkeys() + 2*(idx-1)
 }
 
-func (i IntKey) HashBytes() []byte {
-	buf := make([]byte, binary.MaxVarintLen64)
-	n := binary.PutVarint(buf, (int64(i)))
-	return buf[:n]
-}
-
-func (i IntKey) Equal(other PreHashable) bool {
-	v, ok := other.(IntKey)
-	return ok && i == v
-}
-
-func (s StringKey) HashBytes() []byte {
-	return []byte(s)
-}
-
-func (s StringKey) Equal(other PreHashable) bool {
-	v, ok := other.(StringKey)
-	return ok && s == v
-}
-
-type Table struct {
-	length  int
-	buckets [][]entry
-}
-
-type entry struct {
-	key   PreHashable
-	value any
-}
-
-func NewSized(size int) *Table {
-	return &Table{
-		buckets: make([][]entry, size),
-	}
-}
-
-func (t *Table) Set(k PreHashable, v any) {
-	hash := hashValue(k, len(t.buckets))
-
-	for i, e := range t.buckets[hash] {
-		if e.key == k {
-			t.buckets[hash][i].value = v
-			return
-		}
+func (node BNode) getOffset(idx uint16) uint16 {
+	if idx == 0 {
+		return 0
 	}
 
-	t.buckets[hash] = append(t.buckets[hash], entry{key: k, value: v})
-	t.length += 1
-
-	if t.needExpandBuckets() {
-		t.expandBuckets()
-	}
+	return binary.LittleEndian.Uint16(node[offsetPos(node, idx):])
 }
 
-func (t *Table) Get(k PreHashable) (any, bool) {
-	hash := hashValue(k, len(t.buckets))
-	for _, v := range t.buckets[hash] {
-		if v.key == k {
-			return v.value, true
-		}
-	}
+func (node BNode) setOffset(idx uint16, offset uint16)
 
-	return nil, false
-}
-
-func (t *Table) Delete(k PreHashable) error {
-	hash := hashValue(k, len(t.buckets))
-
-	for i, e := range t.buckets[hash] {
-		if e.key == k {
-			current := t.buckets[hash]
-			// remove item
-			current[i] = current[len(current)-1]
-			current = current[:len(current)-1]
-
-			t.buckets[hash] = current
-			t.length -= 1
-			return nil
-		}
-	}
-
-	return fmt.Errorf("key not found")
-}
-
-func (t *Table) needExpandBuckets() bool {
-	loadFactor := float32(t.length) / float32(len(t.buckets))
-	return loadFactor > loadFactorThreshold
-}
-
-func (t *Table) expandBuckets() {
-	newCapacity := len(t.buckets) * 2
-	newBuckets := make([][]entry, newCapacity)
-
-	for _, bucket := range t.buckets {
-		for _, e := range bucket {
-			newHash := hashValue(e.key, newCapacity)
-			newBuckets[newHash] = append(newBuckets[newHash], e)
-		}
-	}
-
-	t.buckets = newBuckets
-}
-
-func main() {
-	t := NewSized(10)
-	t.Set(StringKey("a"), 1)
-	t.Set(StringKey("b"), 2)
-	t.Set(StringKey("c"), 3)
-
-	e := t.Delete(StringKey("a"))
-	if e != nil {
-		panic(e)
-	}
-
-	fmt.Println(t.Get(StringKey("b")))
+// key-values
+func (node BNode) kvPos(idx uint16) uint16 {
+    return HEADER + 8*node.nkeys() + 2*node.nkeys() + node.getOffset(idx)
 }
