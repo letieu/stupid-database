@@ -1,6 +1,9 @@
 package main
 
-import "encoding/binary"
+import (
+	"bytes"
+	"encoding/binary"
+)
 
 // | type | nkeys |  pointers  |   offsets  | key-values | unused |
 // |  2B  |   2B  | nkeys * 8B | nkeys * 2B |     ...    |        |
@@ -79,5 +82,37 @@ func (node BNode) setOffset(idx uint16, offset uint16)
 
 // key-values
 func (node BNode) kvPos(idx uint16) uint16 {
-    return HEADER + 8*node.nkeys() + 2*node.nkeys() + node.getOffset(idx)
+	return HEADER + 8*node.nkeys() + 2*node.nkeys() + node.getOffset(idx)
+}
+
+func (node BNode) getKey(idx uint16) []byte {
+	pos := node.kvPos(idx)
+	klen := binary.LittleEndian.Uint16(node[pos:])
+	return node[pos+4:][:klen]
+}
+
+func (node BNode) getVal(idx uint16) []byte
+
+func (node BNode) nbytes() uint16 {
+	return node.kvPos(node.nkeys())
+}
+
+// returns the first kid node whose range intersects the key. (kid[i] <= key)
+// TODO: binary search
+func nodeLookupLE(node BNode, key []byte) uint16 {
+	nkeys := node.nkeys()
+	found := uint16(0)
+
+	for i := uint16(1); i < nkeys; i++ {
+		cmp := bytes.Compare(node.getKey(i), key)
+		if cmp <= 0 {
+			found = i
+		}
+
+		if cmp >= 0 {
+			break
+		}
+	}
+
+	return found
 }
