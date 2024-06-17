@@ -116,3 +116,127 @@ func nodeLookupLE(node BNode, key []byte) uint16 {
 
 	return found
 }
+
+func leafInsert(new BNode, old BNode, idx uint16, key []byte, val []byte) {
+	new.setHeader(BNODE_LEAF, old.nkeys()+1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendKV(new, idx, 0, key, val)
+	nodeAppendRange(new, old, idx+1, idx, old.nkeys()-idx)
+}
+
+func leafUpdate(new BNode, old BNode, idx uint16, key []byte, val []byte) {
+	new.setHeader(BNODE_LEAF, old.nkeys()+1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendKV(new, idx, 0, key, val)
+	nodeAppendRange(new, old, idx+1, idx, old.nkeys()-idx)
+}
+
+// copy multiple KVs into the position from the old node
+func nodeAppendRange(
+	new BNode, old BNode,
+	dstNew uint16, srcOld uint16, n uint16,
+)
+
+// copy a KV into the position
+func nodeAppendKV(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
+	new.setPtr(idx, ptr)
+
+	// kv len
+	pos := new.kvPos(idx)
+	binary.LittleEndian.PutUint16(new[pos+0:], uint16(len(key)))
+	binary.LittleEndian.PutUint16(new[pos+2:], uint16(len(val)))
+
+	// kv value
+	copy(new[pos+4:], key)
+	copy(new[pos+4+uint16(len(key)):], val)
+
+	// update the offset of the next key
+	new.setOffset(idx+1, new.getOffset(idx)+4+uint16((len(key)+len(val))))
+}
+
+// replace a link with one or multiple links
+func nodeReplaceKidN(
+	tree *BTree, new BNode, old BNode, idx uint16,
+	kids ...BNode,
+) {
+	inc := uint16(len(kids))
+	new.setHeader(BNODE_NODE, old.nkeys()+inc-1)
+	nodeAppendRange(new, old, 0, 0, idx)
+
+	for i, node := range kids {
+		nodeAppendKV(new, idx+uint16(i), tree.new(node), node.getKey(0), nil)
+		//                ^position      ^pointer        ^key            ^val
+	}
+	nodeAppendRange(new, old, idx+inc, idx+1, old.nkeys()-(idx+1))
+}
+
+// split a oversized node into 2 so that the 2nd node always fits on a page
+func nodeSplit2(left BNode, right BNode, old BNode) {
+	// code omitted...
+}
+
+// split a node if it's too big. the results are 1~3 nodes.
+func nodeSplit3(old BNode) (uint16, [3]BNode) {
+	if old.nbytes() <= BTREE_PAGE_SIZE {
+		old = old[:BTREE_PAGE_SIZE]
+		return 1, [3]BNode{old} // not split
+	}
+	left := BNode(make([]byte, 2*BTREE_PAGE_SIZE)) // might be split later
+	right := BNode(make([]byte, BTREE_PAGE_SIZE))
+	nodeSplit2(left, right, old)
+	if left.nbytes() <= BTREE_PAGE_SIZE {
+		left = left[:BTREE_PAGE_SIZE]
+		return 2, [3]BNode{left, right} // 2 nodes
+	}
+	leftleft := BNode(make([]byte, BTREE_PAGE_SIZE))
+	middle := BNode(make([]byte, BTREE_PAGE_SIZE))
+	nodeSplit2(leftleft, middle, left)
+	// assert(leftleft.nbytes() <= BTREE_PAGE_SIZE)
+	return 3, [3]BNode{leftleft, middle, right} // 3 nodes
+}
+
+// insert a KV into a node, the result might be split.
+// the caller is responsible for deallocating the input node
+// and splitting and allocating result nodes.
+func treeInsert(tree *BTree, node BNode, key []byte, val []byte) BNode {
+	// the result node.
+	// it's allowed to be bigger than 1 page and will be split if so
+	new := make([]byte, 2*BTREE_PAGE_SIZE)
+
+	// where to insert the key?
+	idx := nodeLookupLE(node, key)
+	// act depending on the node type
+	switch node.btype() {
+	case BNODE_LEAF:
+		// leaf, node.getKey(idx) <= key
+		if bytes.Equal(key, node.getKey(idx)) {
+			// found the key, update it.
+			leafUpdate(new, node, idx, key, val)
+		} else {
+			// insert it after the position.
+			leafInsert(new, node, idx+1, key, val)
+		}
+	case BNODE_NODE:
+		// internal node, insert it to a kid node.
+		nodeInsert(tree, new, node, idx, key, val)
+	default:
+		panic("bad node!")
+	}
+	return new
+}
+
+// part of the treeInsert(): KV insertion to an internal node
+func nodeInsert(
+	tree *BTree, new BNode, node BNode, idx uint16,
+	key []byte, val []byte,
+) {
+	kptr := node.getPtr(idx)
+	// recursive insertion to the kid node
+	knode := treeInsert(tree, tree.get(kptr), key, val)
+	// split the result
+	nsplit, split := nodeSplit3(knode)
+	// deallocate the kid node
+	tree.del(kptr)
+	// update the kid links
+	nodeReplaceKidN(tree, new, node, idx, split[:nsplit]...)
+}
